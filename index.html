@@ -19,9 +19,11 @@ window.FIREBASE_CONFIG = {
   messagingSenderId: "450658540764",
   appId: "1:450658540764:web:02785d0a04ba03a0446819"
 };
-/* true cuando actives Storage (plan Blaze) para guardar los PDFs en Firebase.
-   Con false, los PDFs se manejan con la carpeta de SharePoint del mes. */
-window.USAR_STORAGE = false;
+/* Dónde se guardan los PDFs de acuses y detalles:
+   "firestore" → dentro de la base de datos de Firebase (plan gratuito Spark, sin tarjeta).
+   true        → Firebase Storage (requiere plan Blaze).
+   false       → no se guardan; se usa la carpeta de SharePoint del mes. */
+window.USAR_STORAGE = "firestore";
 /* Quién puede entrar y editar:
    "lista"   → solo los correos dados de alta en la colección "usuarios".
    "correo"  → cualquiera con el link que confirme su correo (queda registrado quién hizo cada cambio).
@@ -1052,6 +1054,44 @@ const FB={
       async add(d){ const r=await c.add(self.stamp(Object.assign({}, d, {byName:self.nombre()}))).catch(e=>{ throw self.err(e); }); return {id:r.id}; }
     }; } };
   },
+  // PDFs guardados dentro de Firestore, partidos en bloques (plan gratuito)
+  fsAssetsApi(){
+    const self=this, PARTE=700000; // caracteres base64 por documento (< 1 MB)
+    const aB64=u8=>{ let s=''; for(let i=0;i<u8.length;i+=0x8000) s+=String.fromCharCode.apply(null,u8.subarray(i,i+0x8000)); return btoa(s); };
+    const deB64=b=>{ const bin=atob(b), u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; };
+    return {
+      async upload(blob,opts){
+        const m=(opts&&opts.meta)||{};
+        if(blob.size>15*1024*1024) throw Object.assign(new Error('El PDF pesa más de 15 MB'),{code:'too_large'});
+        const b64=aB64(new Uint8Array(await blob.arrayBuffer()));
+        const n=Math.ceil(b64.length/PARTE)||1;
+        const ref=self.db.collection('archivos').doc();
+        try{
+          for(let i=0;i<n;i++) await ref.collection('partes').doc(String(i)).set({d:b64.slice(i*PARTE,(i+1)*PARTE)});
+          await ref.set({name:m.name||'archivo.pdf', size:blob.size, partes:n, ent:m.ent||null, mes:m.mes!=null?m.mes:null, docTipo:m.docTipo||'acuse',
+            by:SYNC.uid||null, byName:self.nombre(), at:new Date().toISOString()});
+        }catch(e){ throw self.err(e); }
+        return {id:ref.id, sizeBytes:blob.size, contentType:'application/pdf'};
+      },
+      async fetchBlob(a){
+        const ref=self.db.collection('archivos').doc(a.assetId);
+        const meta=await ref.get(); if(!meta.exists) throw new Error('el archivo ya no existe');
+        const n=meta.data().partes||1, trozos=[];
+        for(let i=0;i<n;i++){ const p=await ref.collection('partes').doc(String(i)).get(); trozos.push(p.exists?p.data().d:''); }
+        return new Blob([deB64(trozos.join(''))],{type:'application/pdf'});
+      },
+      async delete(id){
+        const ref=self.db.collection('archivos').doc(id);
+        try{
+          const meta=await ref.get(); const n=meta.exists?(meta.data().partes||1):0;
+          for(let i=0;i<n;i++) await ref.collection('partes').doc(String(i)).delete();
+          await ref.delete();
+        }catch(e){ throw self.err(e); }
+        return {deleted:true};
+      },
+      async list(){ const arr=Object.values(SYNC.acuses||{}).filter(a=>a.assetId); return {assets:[], usage:{firebase:true, files:arr.length, bytes:arr.reduce((t,a)=>t+(+a.size||0),0)}}; }
+    };
+  },
   assetsApi(){
     const self=this;
     const safe=n=>String(n||'archivo.pdf').replace(/[\\/#?\[\]*]/g,'_').replace(/\s+/g,' ').trim();
@@ -1121,7 +1161,7 @@ async function startFirebase(){
   if(typeof firebase==='undefined'){ fbPantalla('<h2>⚠ Sin conexión</h2><p>No se pudo cargar Firebase. Revisa tu conexión a internet y recarga la página.</p>'); return; }
   FB.app=firebase.initializeApp(window.FIREBASE_CONFIG);
   FB.auth=firebase.auth(); FB.db=firebase.firestore();
-  if(window.USAR_STORAGE) FB.st=firebase.storage();
+  if(window.USAR_STORAGE===true) FB.st=firebase.storage();
   const modo=window.MODO_ACCESO||'lista';
   if(modo!=='anonimo') await fbCompletarEnlace();
   FB.auth.onAuthStateChanged(async u=>{
@@ -1165,7 +1205,7 @@ async function startFirebase(){
     const acc=document.getElementById('fb-account'); if(acc){ acc.style.display=''; acc.textContent='👤 '+(FB.email||FB.nombreAnon); }
     const bh=document.getElementById('btn-hist'); if(bh) bh.style.display='';
     SYNC.db=FB.dbApi();
-    SYNC.assets=FB.st ? FB.assetsApi() : null;
+    SYNC.assets=FB.st ? FB.assetsApi() : (window.USAR_STORAGE==='firestore' ? FB.fsAssetsApi() : null);
     if(FB.rol==='lector') setReadOnly();
     let first=true;
     SYNC.db.collection('pagos').onSnapshot(snap=>{
@@ -2270,7 +2310,7 @@ async function renderUsage(){
   try{
     const {usage}=await SYNC.assets.list();
     const mb=b=>(b/1048576).toLocaleString('es-MX',{maximumFractionDigits:1});
-    if(usage.firebase) el.textContent='Firebase Storage: '+mb(usage.bytes)+' MB en '+usage.files+' PDFs';
+    if(usage.firebase) el.textContent='PDFs guardados: '+usage.files+' · '+mb(usage.bytes)+' MB de 1,024 MB del plan gratuito';
     else el.textContent='Espacio usado: '+mb(usage.bytes)+' MB de '+mb(usage.maxBytes)+' MB · '+usage.files+' de '+usage.maxFiles+' archivos';
   }catch(e){ el.textContent=''; }
 }
@@ -3139,7 +3179,7 @@ function renderAcusesCargados(){
   const info=document.getElementById('acu-info-txt');
   if(info) info.textContent = !SYNC.db
     ? 'Modo local: los PDFs solo están disponibles mientras la página esté abierta.'
-    : (SYNC.backend==='firebase' && SYNC.assets ? 'Cada acuse y detalle que se importa se guarda automáticamente en Firebase Storage y queda disponible para todos los usuarios autorizados.'
+    : (SYNC.backend==='firebase' && SYNC.assets ? 'Cada acuse y detalle que se importa se guarda automáticamente en la base de datos del dashboard y cualquier persona con el link lo puede descargar.'
      : SYNC.backend==='firebase' ? 'Los PDFs se guardan en la carpeta de SharePoint del mes (ver “Control de acuses del mes”). También puedes registrar enlaces con “🔗 Agregar enlace”.'
      : SYNC.assets && !SYNC.externo ? 'Cada acuse y detalle que se importa se guarda automáticamente. También puedes registrar el enlace de un PDF guardado en la carpeta compartida con “🔗 Agregar enlace”.'
      : !SYNC.readOnly ? 'Guarda los PDFs en la carpeta compartida (OneDrive, SharePoint o Google Drive) y registra aquí su enlace con “🔗 Agregar enlace”. Los importes se siguen importando desde Cargar Acuses.'
